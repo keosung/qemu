@@ -13,6 +13,7 @@
 
 #include "hw/pci/pci_device.h"
 #include "hw/scsi/scsi.h"
+#include "qemu/timer.h"
 #include "block/ufs.h"
 
 #define UFS_MAX_LUS 32
@@ -91,6 +92,8 @@ typedef struct UfsParams {
     bool mcq; /* Multiple Command Queue support */
     uint8_t mcq_qcfgptr; /* MCQ Queue Configuration Pointer in MCQCAP */
     uint8_t mcq_maxq; /* MCQ Maximum number of Queues */
+    uint32_t hid_max_fragments; /* HID: max fragment count */
+    uint32_t hid_defrag_interval_ms; /* HID: defrag timer interval in ms */
 } UfsParams;
 
 /*
@@ -148,6 +151,11 @@ typedef struct UfsHc {
     UfsCq *cq[UFS_MAX_MCQ_QNUM];
 
     uint8_t temperature;
+
+    /* HID (Host Initiated Defragmentation) emulation state */
+    QEMUTimer hid_defrag_timer;
+    uint32_t hid_fragment_count;
+    uint32_t hid_defrag_total; /* fragment count when defrag started */
 } UfsHc;
 
 static inline uint32_t ufs_mcq_sq_tail(UfsHc *u, uint32_t qid)

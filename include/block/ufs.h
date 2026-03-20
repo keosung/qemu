@@ -473,6 +473,12 @@ typedef struct Attributes {
     uint8_t refresh_freq;
     uint8_t refresh_unit;
     uint8_t refresh_method;
+    /* HID (Host Initiated Defragmentation) attributes */
+    uint8_t defrag_operation;
+    uint32_t hid_available_size;
+    uint32_t hid_size;
+    uint8_t hid_progress_ratio;
+    uint8_t hid_state;
 } Attributes;
 
 #define UFS_TRANSACTION_SPECIFIC_FIELD_SIZE 20
@@ -896,7 +902,30 @@ enum attr_idn {
     UFS_QUERY_ATTR_IDN_REFRESH_STATUS = 0x2C,
     UFS_QUERY_ATTR_IDN_REFRESH_FREQ = 0x2D,
     UFS_QUERY_ATTR_IDN_REFRESH_UNIT = 0x2E,
+    UFS_QUERY_ATTR_IDN_REFRESH_METHOD = 0x2F,
+    UFS_QUERY_ATTR_IDN_DEFRAG_OPERATION = 0x35,
+    UFS_QUERY_ATTR_IDN_HID_AVAILABLE_SIZE = 0x36,
+    UFS_QUERY_ATTR_IDN_HID_SIZE = 0x37,
+    UFS_QUERY_ATTR_IDN_HID_PROGRESS_RATIO = 0x38,
+    UFS_QUERY_ATTR_IDN_HID_STATE = 0x39,
     UFS_QUERY_ATTR_IDN_COUNT,
+};
+
+/* HID (Host Initiated Defragmentation) operation values for bDefragOperation */
+enum ufs_hid_op {
+    UFS_HID_OP_DISABLE = 0x00,
+    UFS_HID_OP_ANALYSIS = 0x01,
+    UFS_HID_OP_DEFRAG = 0x02,
+};
+
+/* HID state values for bHIDState */
+enum ufs_hid_state {
+    UFS_HID_STATE_IDLE = 0x00,
+    UFS_HID_STATE_ANALYSIS_IN_PROGRESS = 0x01,
+    UFS_HID_STATE_DEFRAG_REQUIRED = 0x02,
+    UFS_HID_STATE_DEFRAG_IN_PROGRESS = 0x03,
+    UFS_HID_STATE_DEFRAG_COMPLETED = 0x04,
+    UFS_HID_STATE_DEFRAG_NOT_REQUIRED = 0x05,
 };
 
 /* Descriptor idn for Query requests */
@@ -1076,6 +1105,7 @@ enum health_desc_param {
 enum {
     UFS_DEV_HIGH_TEMP_NOTIF = BIT(4),
     UFS_DEV_LOW_TEMP_NOTIF = BIT(5),
+    UFS_DEV_HID_SUPPORT = BIT(13),
 };
 
 /* WriteBooster buffer mode */

@@ -30,7 +30,7 @@
 #include "ufs.h"
 
 /* The QEMU-UFS device follows spec version 4.0 */
-#define UFS_SPEC_VER 0x0400
+#define UFS_SPEC_VER 0x0500
 #define UFS_MAX_NUTRS 32
 #define UFS_MAX_NUTMRS 8
 #define UFS_MCQ_QCFGPTR 2
@@ -39,6 +39,13 @@
 #define UFS_TEMPERATURE 120
 #define UFS_TOO_HIGH_TEMP_BOUNDARY 160
 #define UFS_TOO_LOW_TEMP_BOUNDARY 60
+
+/* HID emulation defaults */
+#define UFS_HID_MAX_FRAGMENTS       1024
+#define UFS_HID_DEFRAG_INTERVAL_MS  100
+#define UFS_HID_DEFRAG_BATCH_DIV    10   /* process ~10% of remaining per tick */
+#define UFS_HID_PROGRESS_COMPLETE   100
+#define UFS_SECTORS_PER_FRAGMENT    8    /* 4KB = 8 x 512B sectors */
 
 static void ufs_exec_req(UfsRequest *req);
 static void ufs_clear_req(UfsRequest *req);
@@ -940,6 +947,38 @@ static UfsReqResult ufs_exec_scsi_cmd(UfsRequest *req)
 
     trace_ufs_exec_scsi_cmd(req->slot, lun, req->req_upiu.sc.cdb[0]);
 
+    /* HID: track write I/Os to simulate fragmentation.
+     * Count fragments based on the number of logical blocks written,
+     * not per SCSI command, since the block layer may merge I/Os.
+     */
+    if (req->req_upiu.header.flags & UFS_UPIU_CMD_FLAGS_WRITE) {
+        uint8_t *cdb = req->req_upiu.sc.cdb;
+        uint32_t transfer_len = 0;
+        uint32_t frags;
+
+        switch (cdb[0]) {
+        case 0x2A: /* WRITE(10) */
+            transfer_len = (cdb[7] << 8) | cdb[8];
+            break;
+        case 0x8A: /* WRITE(16) */
+            transfer_len = (cdb[10] << 24) | (cdb[11] << 16) |
+                           (cdb[12] << 8) | cdb[13];
+            break;
+        case 0x0A: /* WRITE(6) */
+            transfer_len = cdb[4] ? cdb[4] : 256;
+            break;
+        default:
+            break;
+        }
+
+        if (transfer_len > 0) {
+            frags = (transfer_len + UFS_SECTORS_PER_FRAGMENT - 1) /
+                    UFS_SECTORS_PER_FRAGMENT;
+            u->hid_fragment_count = MIN(u->hid_fragment_count + frags,
+                                        u->params.hid_max_fragments);
+        }
+    }
+
     if (!is_wlun(lun) && (lun >= UFS_MAX_LUS || u->lus[lun] == NULL)) {
         trace_ufs_err_scsi_cmd_invalid_lun(lun);
         return UFS_REQUEST_FAIL;
@@ -1061,6 +1100,14 @@ static const int attr_permission[UFS_QUERY_ATTR_IDN_COUNT] = {
     [UFS_QUERY_ATTR_IDN_REFRESH_STATUS] = UFS_QUERY_ATTR_READ,
     [UFS_QUERY_ATTR_IDN_REFRESH_FREQ] = UFS_QUERY_ATTR_READ,
     [UFS_QUERY_ATTR_IDN_REFRESH_UNIT] = UFS_QUERY_ATTR_READ,
+    /* HID attributes */
+    [UFS_QUERY_ATTR_IDN_DEFRAG_OPERATION] =
+        UFS_QUERY_ATTR_READ | UFS_QUERY_ATTR_WRITE,
+    [UFS_QUERY_ATTR_IDN_HID_AVAILABLE_SIZE] = UFS_QUERY_ATTR_READ,
+    [UFS_QUERY_ATTR_IDN_HID_SIZE] =
+        UFS_QUERY_ATTR_READ | UFS_QUERY_ATTR_WRITE,
+    [UFS_QUERY_ATTR_IDN_HID_PROGRESS_RATIO] = UFS_QUERY_ATTR_READ,
+    [UFS_QUERY_ATTR_IDN_HID_STATE] = UFS_QUERY_ATTR_READ,
 };
 
 static inline QueryRespCode ufs_attr_check_idn_valid(uint8_t idn, int op)
@@ -1133,6 +1180,15 @@ static inline uint8_t ufs_read_device_temp(UfsHc *u)
     return 0;
 }
 
+static void ufs_hid_reset(UfsHc *u)
+{
+    timer_del(&u->hid_defrag_timer);
+    u->attributes.defrag_operation = UFS_HID_OP_DISABLE;
+    u->attributes.hid_state = UFS_HID_STATE_IDLE;
+    u->attributes.hid_progress_ratio = 0;
+    u->attributes.hid_available_size = cpu_to_be32(0xFFFFFFFF);
+}
+
 static uint32_t ufs_read_attr_value(UfsHc *u, uint8_t idn)
 {
     switch (idn) {
@@ -1200,8 +1256,85 @@ static uint32_t ufs_read_attr_value(UfsHc *u, uint8_t idn)
         return u->attributes.refresh_freq;
     case UFS_QUERY_ATTR_IDN_REFRESH_UNIT:
         return u->attributes.refresh_unit;
+    case UFS_QUERY_ATTR_IDN_DEFRAG_OPERATION:
+        return u->attributes.defrag_operation;
+    case UFS_QUERY_ATTR_IDN_HID_AVAILABLE_SIZE:
+        /*
+         * If HID state is idle or analysis hasn't run, return stored value.
+         * During/after analysis or defrag, reflect live fragment count.
+         */
+        if (u->attributes.hid_state != UFS_HID_STATE_IDLE) {
+            return u->hid_fragment_count;
+        }
+        return be32_to_cpu(u->attributes.hid_available_size);
+    case UFS_QUERY_ATTR_IDN_HID_SIZE:
+        return be32_to_cpu(u->attributes.hid_size);
+    case UFS_QUERY_ATTR_IDN_HID_PROGRESS_RATIO:
+        return u->attributes.hid_progress_ratio;
+    case UFS_QUERY_ATTR_IDN_HID_STATE:
+    {
+        uint8_t state = u->attributes.hid_state;
+
+        /* Reading in completed/not-required state resets HID to Idle */
+        if (state == UFS_HID_STATE_DEFRAG_COMPLETED ||
+            state == UFS_HID_STATE_DEFRAG_NOT_REQUIRED) {
+            trace_ufs_hid_state_read_reset(state);
+            ufs_hid_reset(u);
+        }
+        return state;
+    }
     }
     return 0;
+}
+
+/*
+ * UFS HID state machine (JESD220H Table 14.18):
+ *
+ *   bDefragOperation=0x01 (Analysis Only):
+ *     Idle -> Analysis In Progress -> Defrag Required / Defrag Not Required
+ *
+ *   bDefragOperation=0x02 (Analysis + Defrag):
+ *     Idle -> Analysis In Progress -> Defrag Required ->
+ *     Defrag In Progress -> Defrag Completed / Defrag Not Required
+ *
+ *   bDefragOperation=0x00 (Disable):
+ *     Any state -> Idle
+ *
+ *   Reading bHIDState when Completed or Not Required -> resets to Idle
+ *
+ * Since this is emulation, the analysis phase completes instantly.
+ * The defrag phase runs via a timer when the device is idle.
+ */
+static QueryRespCode ufs_hid_write_defrag_operation(UfsHc *u, uint32_t value)
+{
+    switch (value) {
+    case UFS_HID_OP_DISABLE:
+        ufs_hid_reset(u);
+        break;
+    case UFS_HID_OP_ANALYSIS:
+    case UFS_HID_OP_DEFRAG:
+        /*
+         * Both operations begin with analysis. Enter Analysis In Progress
+         * state and let the timer drive the remaining state transitions:
+         *
+         *   Analysis Only:  Analysis In Progress -> Required / Not Required
+         *   Defrag:         Analysis In Progress -> Required ->
+         *                   Defrag In Progress -> Completed / Not Required
+         */
+        u->attributes.defrag_operation = value;
+        u->attributes.hid_state = UFS_HID_STATE_ANALYSIS_IN_PROGRESS;
+        u->attributes.hid_progress_ratio = 0x00;
+        u->hid_defrag_total = u->hid_fragment_count;
+        timer_mod(&u->hid_defrag_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  u->params.hid_defrag_interval_ms);
+        break;
+    default:
+        return UFS_QUERY_RESULT_INVALID_VALUE;
+    }
+
+    trace_ufs_hid_defrag_operation(value, u->attributes.hid_state);
+    return UFS_QUERY_RESULT_SUCCESS;
 }
 
 static QueryRespCode ufs_write_attr_value(UfsHc *u, uint8_t idn, uint32_t value)
@@ -1236,6 +1369,11 @@ static QueryRespCode ufs_write_attr_value(UfsHc *u, uint8_t idn, uint32_t value)
         break;
     case UFS_QUERY_ATTR_IDN_PSA_DATA_SIZE:
         u->attributes.psa_data_size = cpu_to_be32(value);
+        break;
+    case UFS_QUERY_ATTR_IDN_DEFRAG_OPERATION:
+        return ufs_hid_write_defrag_operation(u, value);
+    case UFS_QUERY_ATTR_IDN_HID_SIZE:
+        u->attributes.hid_size = cpu_to_be32(value);
         break;
     }
     return UFS_QUERY_RESULT_SUCCESS;
@@ -1687,6 +1825,113 @@ static void ufs_init_pci(UfsHc *u, PCIDevice *pci_dev)
     u->irq = pci_allocate_irq(pci_dev);
 }
 
+static bool ufs_hid_device_idle(UfsHc *u)
+{
+    int i;
+
+    /* Non-MCQ: check doorbell register for outstanding requests */
+    if (u->reg.utrldbr != 0) {
+        return false;
+    }
+
+    /* MCQ: check all submission queues for pending entries */
+    if (FIELD_EX32(u->reg.mcqcap, MCQCAP, MAXQ)) {
+        for (i = 0; i < FIELD_EX32(u->reg.mcqcap, MCQCAP, MAXQ) + 1; i++) {
+            if (u->sq[i] && ufs_mcq_sq_tail(u, i) != ufs_mcq_sq_head(u, i)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+static void ufs_hid_defrag_timer_cb(void *opaque)
+{
+    UfsHc *u = opaque;
+
+    /* Only proceed when device is idle (no in-flight I/O) */
+    if (!ufs_hid_device_idle(u)) {
+        goto reschedule;
+    }
+
+    switch (u->attributes.hid_state) {
+    case UFS_HID_STATE_ANALYSIS_IN_PROGRESS:
+        /*
+         * Analysis complete. Report fragment count and transition to
+         * Defrag Required or Not Required.
+         */
+        u->attributes.hid_available_size =
+            cpu_to_be32(u->hid_fragment_count);
+        if (u->hid_fragment_count > 0) {
+            u->attributes.hid_state = UFS_HID_STATE_DEFRAG_REQUIRED;
+        } else {
+            u->attributes.hid_state = UFS_HID_STATE_DEFRAG_NOT_REQUIRED;
+            return; /* Stop timer */
+        }
+
+        /* Analysis-only: stop here at Defrag Required */
+        if (u->attributes.defrag_operation == UFS_HID_OP_ANALYSIS) {
+            return; /* Stop timer */
+        }
+
+        /* Analysis + Defrag: fall through to start defrag */
+        goto reschedule;
+
+    case UFS_HID_STATE_DEFRAG_REQUIRED:
+        /* Transition to Defrag In Progress */
+        u->attributes.hid_state = UFS_HID_STATE_DEFRAG_IN_PROGRESS;
+        u->hid_defrag_total = u->hid_fragment_count;
+        u->attributes.hid_progress_ratio = 0x00;
+        goto reschedule;
+
+    case UFS_HID_STATE_DEFRAG_IN_PROGRESS:
+    {
+        uint32_t batch, done;
+
+        if (u->hid_fragment_count > 0) {
+            batch = u->hid_fragment_count / UFS_HID_DEFRAG_BATCH_DIV;
+            if (batch == 0) {
+                batch = 1;
+            }
+            u->hid_fragment_count -= batch;
+
+            if (u->hid_defrag_total > 0) {
+                done = u->hid_defrag_total - u->hid_fragment_count;
+                u->attributes.hid_progress_ratio =
+                    (done * UFS_HID_PROGRESS_COMPLETE) / u->hid_defrag_total;
+            }
+
+            trace_ufs_hid_defrag_progress(u->hid_fragment_count,
+                                          u->attributes.hid_progress_ratio);
+        }
+
+        if (u->hid_fragment_count == 0) {
+            /*
+             * Defrag completed. Keep defrag_operation as-is per spec;
+             * host reads bHIDState to acknowledge and reset to Idle.
+             */
+            u->attributes.hid_state = UFS_HID_STATE_DEFRAG_COMPLETED;
+            u->attributes.hid_progress_ratio = UFS_HID_PROGRESS_COMPLETE;
+            u->attributes.hid_available_size = cpu_to_be32(0);
+            trace_ufs_hid_defrag_operation(u->attributes.defrag_operation,
+                                           u->attributes.hid_state);
+            return; /* Stop timer */
+        }
+        goto reschedule;
+    }
+
+    default:
+        /* Unexpected state, stop timer */
+        return;
+    }
+
+reschedule:
+    timer_mod(&u->hid_defrag_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+              u->params.hid_defrag_interval_ms);
+}
+
 static void ufs_init_state(UfsHc *u)
 {
     u->req_list = g_new0(UfsRequest, u->params.nutrs);
@@ -1702,6 +1947,9 @@ static void ufs_init_state(UfsHc *u)
                                          &DEVICE(u)->mem_reentrancy_guard);
     u->complete_bh = qemu_bh_new_guarded(ufs_sendback_req, u,
                                          &DEVICE(u)->mem_reentrancy_guard);
+
+    timer_init_ms(&u->hid_defrag_timer, QEMU_CLOCK_VIRTUAL,
+                  ufs_hid_defrag_timer_cb, u);
 
     if (u->params.mcq) {
         memset(u->sq, 0, sizeof(u->sq));
@@ -1775,7 +2023,8 @@ static void ufs_init_hc(UfsHc *u)
     u->device_desc.queue_depth = u->params.nutrs;
     u->device_desc.product_revision_level = 0x04;
     u->device_desc.extended_ufs_features_support =
-        cpu_to_be32(UFS_DEV_HIGH_TEMP_NOTIF | UFS_DEV_LOW_TEMP_NOTIF);
+        cpu_to_be32(UFS_DEV_HIGH_TEMP_NOTIF | UFS_DEV_LOW_TEMP_NOTIF |
+                    UFS_DEV_HID_SUPPORT);
 
     memset(&u->geometry_desc, 0, sizeof(GeometryDescriptor));
     u->geometry_desc.length = sizeof(GeometryDescriptor);
@@ -1801,6 +2050,9 @@ static void ufs_init_hc(UfsHc *u)
     u->attributes.max_num_of_rtt = 0x02;
     u->attributes.device_too_high_temp_boundary = UFS_TOO_HIGH_TEMP_BOUNDARY;
     u->attributes.device_too_low_temp_boundary = UFS_TOO_LOW_TEMP_BOUNDARY;
+    /* HID defaults: 0xFFFFFFFF means "not specified" per JESD220H */
+    u->attributes.hid_available_size = cpu_to_be32(0xFFFFFFFF);
+    u->attributes.hid_size = cpu_to_be32(0xFFFFFFFF);
 
     memset(&u->flags, 0, sizeof(u->flags));
     u->flags.permanently_disable_fw_update = 1;
@@ -1837,6 +2089,7 @@ static void ufs_exit(PCIDevice *pci_dev)
 {
     UfsHc *u = UFS(pci_dev);
 
+    timer_del(&u->hid_defrag_timer);
     qemu_free_irq(u->irq);
 
     qemu_bh_delete(u->doorbell_bh);
@@ -1865,6 +2118,11 @@ static const Property ufs_props[] = {
     DEFINE_PROP_UINT8("nutmrs", UfsHc, params.nutmrs, 8),
     DEFINE_PROP_BOOL("mcq", UfsHc, params.mcq, false),
     DEFINE_PROP_UINT8("mcq-maxq", UfsHc, params.mcq_maxq, 2),
+    DEFINE_PROP_UINT32("hid-max-fragments", UfsHc, params.hid_max_fragments,
+                       UFS_HID_MAX_FRAGMENTS),
+    DEFINE_PROP_UINT32("hid-defrag-interval-ms", UfsHc,
+                       params.hid_defrag_interval_ms,
+                       UFS_HID_DEFRAG_INTERVAL_MS),
 };
 
 static const VMStateDescription ufs_vmstate = {

@@ -1182,6 +1182,262 @@ static void ufstest_query_desc_request(void *obj, void *data,
     ufs_exit(ufs, alloc);
 }
 
+/*
+ * Helper to read a single HID attribute value.
+ * Returns the host-endian attribute value; asserts OCS success.
+ */
+static uint32_t ufs_hid_read_attr(QUfs *ufs, uint8_t idn)
+{
+    enum UtpOcsCodes ocs;
+    UtpUpiuRsp rsp;
+
+    ocs = ufs_send_query(ufs, UFS_UPIU_QUERY_FUNC_STANDARD_READ_REQUEST,
+                         UFS_UPIU_QUERY_OPCODE_READ_ATTR,
+                         idn, 0, 0, 0, &rsp);
+    g_assert_cmpuint(ocs, ==, UFS_OCS_SUCCESS);
+    g_assert_cmpuint(rsp.header.response, ==, UFS_COMMAND_RESULT_SUCCESS);
+    return be32_to_cpu(rsp.qr.value);
+}
+
+/*
+ * Helper to write a single HID attribute value.
+ * Asserts OCS success.
+ */
+static void ufs_hid_write_attr(QUfs *ufs, uint8_t idn, uint32_t value)
+{
+    enum UtpOcsCodes ocs;
+    UtpUpiuRsp rsp;
+
+    ocs = ufs_send_query(ufs, UFS_UPIU_QUERY_FUNC_STANDARD_WRITE_REQUEST,
+                         UFS_UPIU_QUERY_OPCODE_WRITE_ATTR,
+                         idn, 0, 0, value, &rsp);
+    g_assert_cmpuint(ocs, ==, UFS_OCS_SUCCESS);
+    g_assert_cmpuint(rsp.header.response, ==, UFS_COMMAND_RESULT_SUCCESS);
+}
+
+/*
+ * Advance the virtual clock to fire the HID defrag timer once.
+ * The default defrag interval is 100ms; step slightly past it.
+ */
+static void ufs_hid_clock_step(QUfs *ufs)
+{
+    qtest_clock_step(ufs->dev.bus->qts, 101 * 1000000LL); /* 101ms in ns */
+}
+
+static void ufstest_hid(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QUfs *ufs = obj;
+    uint32_t val;
+    enum UtpOcsCodes ocs;
+    UtpUpiuRsp rsp;
+    const int test_lun = 1;
+    const uint8_t request_sense_cdb[UFS_CDB_SIZE] = {
+        REQUEST_SENSE,
+    };
+    const uint8_t write_cdb[UFS_CDB_SIZE] = {
+        /* WRITE(10) to LBA 0, transfer length 8 sectors = 1 fragment */
+        WRITE_10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00
+    };
+    uint8_t write_buf[4096];
+    uint8_t read_buf[4096];
+    int i;
+
+    ufs_init(ufs, alloc);
+
+    /* Clear Unit Attention */
+    ufs_send_scsi_command(ufs, test_lun, request_sense_cdb, NULL, 0,
+                          read_buf, sizeof(read_buf), &rsp);
+
+    /*
+     * 1. Verify HID default attribute values
+     */
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_DEFRAG_OPERATION);
+    g_assert_cmpuint(val, ==, UFS_HID_OP_DISABLE);
+
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_AVAILABLE_SIZE);
+    g_assert_cmpuint(val, ==, 0xFFFFFFFF);
+
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_SIZE);
+    g_assert_cmpuint(val, ==, 0xFFFFFFFF);
+
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_PROGRESS_RATIO);
+    g_assert_cmpuint(val, ==, 0);
+
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_STATE);
+    g_assert_cmpuint(val, ==, UFS_HID_STATE_IDLE);
+
+    /*
+     * 2. Verify read-only attributes reject writes
+     */
+    ocs = ufs_send_query(ufs, UFS_UPIU_QUERY_FUNC_STANDARD_WRITE_REQUEST,
+                         UFS_UPIU_QUERY_OPCODE_WRITE_ATTR,
+                         UFS_QUERY_ATTR_IDN_HID_AVAILABLE_SIZE, 0, 0, 0x100,
+                         &rsp);
+    g_assert_cmpuint(ocs, ==, UFS_OCS_INVALID_CMD_TABLE_ATTR);
+    g_assert_cmpuint(rsp.header.response, ==,
+                     UFS_QUERY_RESULT_NOT_WRITEABLE);
+
+    ocs = ufs_send_query(ufs, UFS_UPIU_QUERY_FUNC_STANDARD_WRITE_REQUEST,
+                         UFS_UPIU_QUERY_OPCODE_WRITE_ATTR,
+                         UFS_QUERY_ATTR_IDN_HID_PROGRESS_RATIO, 0, 0, 50,
+                         &rsp);
+    g_assert_cmpuint(ocs, ==, UFS_OCS_INVALID_CMD_TABLE_ATTR);
+    g_assert_cmpuint(rsp.header.response, ==,
+                     UFS_QUERY_RESULT_NOT_WRITEABLE);
+
+    ocs = ufs_send_query(ufs, UFS_UPIU_QUERY_FUNC_STANDARD_WRITE_REQUEST,
+                         UFS_UPIU_QUERY_OPCODE_WRITE_ATTR,
+                         UFS_QUERY_ATTR_IDN_HID_STATE, 0, 0, 0x01, &rsp);
+    g_assert_cmpuint(ocs, ==, UFS_OCS_INVALID_CMD_TABLE_ATTR);
+    g_assert_cmpuint(rsp.header.response, ==,
+                     UFS_QUERY_RESULT_NOT_WRITEABLE);
+
+    /*
+     * 3. Verify invalid bDefragOperation value is rejected
+     */
+    ocs = ufs_send_query(ufs, UFS_UPIU_QUERY_FUNC_STANDARD_WRITE_REQUEST,
+                         UFS_UPIU_QUERY_OPCODE_WRITE_ATTR,
+                         UFS_QUERY_ATTR_IDN_DEFRAG_OPERATION, 0, 0, 0x03,
+                         &rsp);
+    g_assert_cmpuint(ocs, ==, UFS_OCS_INVALID_CMD_TABLE_ATTR);
+    g_assert_cmpuint(rsp.header.response, ==,
+                     UFS_QUERY_RESULT_INVALID_VALUE);
+
+    /*
+     * 4. dHIDSize is writable and readable
+     */
+    ufs_hid_write_attr(ufs, UFS_QUERY_ATTR_IDN_HID_SIZE, 0x100);
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_SIZE);
+    g_assert_cmpuint(val, ==, 0x100);
+
+    /* Restore default */
+    ufs_hid_write_attr(ufs, UFS_QUERY_ATTR_IDN_HID_SIZE, 0xFFFFFFFF);
+
+    /*
+     * 5. Analysis with no fragments -> Defrag Not Required
+     */
+    ufs_hid_write_attr(ufs, UFS_QUERY_ATTR_IDN_DEFRAG_OPERATION,
+                       UFS_HID_OP_ANALYSIS);
+
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_STATE);
+    g_assert_cmpuint(val, ==, UFS_HID_STATE_ANALYSIS_IN_PROGRESS);
+
+    /* Let the timer fire to complete analysis */
+    ufs_hid_clock_step(ufs);
+
+    /* Read available size before state, since reading state auto-resets */
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_AVAILABLE_SIZE);
+    g_assert_cmpuint(val, ==, 0);
+
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_STATE);
+    g_assert_cmpuint(val, ==, UFS_HID_STATE_DEFRAG_NOT_REQUIRED);
+
+    /* Reading Not Required auto-resets to Idle */
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_STATE);
+    g_assert_cmpuint(val, ==, UFS_HID_STATE_IDLE);
+
+    /*
+     * 6. Generate fragmentation via SCSI WRITE, then analyze
+     */
+    memset(write_buf, 0xab, sizeof(write_buf));
+    for (i = 0; i < 4; i++) {
+        ocs = ufs_send_scsi_command(ufs, test_lun, write_cdb, write_buf,
+                                    sizeof(write_buf), NULL, 0, &rsp);
+        g_assert_cmpuint(ocs, ==, UFS_OCS_SUCCESS);
+    }
+
+    /* Analysis should now find fragments */
+    ufs_hid_write_attr(ufs, UFS_QUERY_ATTR_IDN_DEFRAG_OPERATION,
+                       UFS_HID_OP_ANALYSIS);
+    ufs_hid_clock_step(ufs);
+
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_STATE);
+    g_assert_cmpuint(val, ==, UFS_HID_STATE_DEFRAG_REQUIRED);
+
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_AVAILABLE_SIZE);
+    g_assert_cmpuint(val, >, 0);
+
+    /*
+     * 7. Disable resets to Idle from any state
+     */
+    ufs_hid_write_attr(ufs, UFS_QUERY_ATTR_IDN_DEFRAG_OPERATION,
+                       UFS_HID_OP_DISABLE);
+
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_STATE);
+    g_assert_cmpuint(val, ==, UFS_HID_STATE_IDLE);
+
+    /*
+     * 8. Full defrag cycle: Analysis In Progress -> Defrag Required ->
+     *    Defrag In Progress -> Defrag Completed
+     */
+    /* Re-generate fragments */
+    for (i = 0; i < 4; i++) {
+        ocs = ufs_send_scsi_command(ufs, test_lun, write_cdb, write_buf,
+                                    sizeof(write_buf), NULL, 0, &rsp);
+        g_assert_cmpuint(ocs, ==, UFS_OCS_SUCCESS);
+    }
+
+    ufs_hid_write_attr(ufs, UFS_QUERY_ATTR_IDN_DEFRAG_OPERATION,
+                       UFS_HID_OP_DEFRAG);
+
+    /* Should start in Analysis In Progress */
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_STATE);
+    g_assert_cmpuint(val, ==, UFS_HID_STATE_ANALYSIS_IN_PROGRESS);
+
+    /* Step through state machine: analysis -> required -> in progress */
+    ufs_hid_clock_step(ufs);
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_STATE);
+    g_assert_cmpuint(val, ==, UFS_HID_STATE_DEFRAG_REQUIRED);
+
+    ufs_hid_clock_step(ufs);
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_STATE);
+    g_assert_cmpuint(val, ==, UFS_HID_STATE_DEFRAG_IN_PROGRESS);
+
+    /* Progress should be between 0 and 100 during defrag */
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_PROGRESS_RATIO);
+    g_assert_cmpuint(val, <=, 100);
+
+    /*
+     * Keep stepping until defrag completes.
+     * Poll progress ratio (non-destructive) instead of bHIDState,
+     * because reading bHIDState in Completed state triggers auto-reset.
+     */
+    for (i = 0; i < 50; i++) {
+        ufs_hid_clock_step(ufs);
+        val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_PROGRESS_RATIO);
+        if (val == 100) {
+            break;
+        }
+    }
+    g_assert_cmpuint(val, ==, 100);
+
+    /* Verify Completed state attributes before reading bHIDState */
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_AVAILABLE_SIZE);
+    g_assert_cmpuint(val, ==, 0);
+
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_DEFRAG_OPERATION);
+    g_assert_cmpuint(val, ==, UFS_HID_OP_DEFRAG);
+
+    /*
+     * 9. Reading bHIDState in Completed state resets to Idle.
+     *    First read returns Completed, second read returns Idle.
+     */
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_STATE);
+    g_assert_cmpuint(val, ==, UFS_HID_STATE_DEFRAG_COMPLETED);
+
+    /* Auto-reset: now should be Idle */
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_STATE);
+    g_assert_cmpuint(val, ==, UFS_HID_STATE_IDLE);
+
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_DEFRAG_OPERATION);
+    g_assert_cmpuint(val, ==, UFS_HID_OP_DISABLE);
+
+    val = ufs_hid_read_attr(ufs, UFS_QUERY_ATTR_IDN_HID_AVAILABLE_SIZE);
+    g_assert_cmpuint(val, ==, 0xFFFFFFFF);
+
+    ufs_exit(ufs, alloc);
+}
+
 static void drive_destroy(void *path)
 {
     unlink(path);
@@ -1262,6 +1518,7 @@ static void ufs_register_nodes(void)
                  &io_test_opts);
     qos_add_test("query-desciptor", "ufs", ufstest_query_desc_request,
                  &io_test_opts);
+    qos_add_test("hid", "ufs", ufstest_hid, &io_test_opts);
 }
 
 libqos_init(ufs_register_nodes);
