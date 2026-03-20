@@ -45,7 +45,6 @@
 #define UFS_HID_DEFRAG_INTERVAL_MS  100
 #define UFS_HID_DEFRAG_BATCH_DIV    10   /* process ~10% of remaining per tick */
 #define UFS_HID_PROGRESS_COMPLETE   100
-#define UFS_SECTORS_PER_FRAGMENT    8    /* 4KB = 8 x 512B sectors */
 
 static void ufs_exec_req(UfsRequest *req);
 static void ufs_clear_req(UfsRequest *req);
@@ -947,36 +946,14 @@ static UfsReqResult ufs_exec_scsi_cmd(UfsRequest *req)
 
     trace_ufs_exec_scsi_cmd(req->slot, lun, req->req_upiu.sc.cdb[0]);
 
-    /* HID: track write I/Os to simulate fragmentation.
-     * Count fragments based on the number of logical blocks written,
-     * not per SCSI command, since the block layer may merge I/Os.
+    /*
+     * HID: track write SCSI commands to simulate fragmentation.
+     * Each write command adds one fragment (unit: 4KB) to the count,
+     * which is reported via dHIDAvailableSize in 4KB granularity.
      */
     if (req->req_upiu.header.flags & UFS_UPIU_CMD_FLAGS_WRITE) {
-        uint8_t *cdb = req->req_upiu.sc.cdb;
-        uint32_t transfer_len = 0;
-        uint32_t frags;
-
-        switch (cdb[0]) {
-        case 0x2A: /* WRITE(10) */
-            transfer_len = (cdb[7] << 8) | cdb[8];
-            break;
-        case 0x8A: /* WRITE(16) */
-            transfer_len = (cdb[10] << 24) | (cdb[11] << 16) |
-                           (cdb[12] << 8) | cdb[13];
-            break;
-        case 0x0A: /* WRITE(6) */
-            transfer_len = cdb[4] ? cdb[4] : 256;
-            break;
-        default:
-            break;
-        }
-
-        if (transfer_len > 0) {
-            frags = (transfer_len + UFS_SECTORS_PER_FRAGMENT - 1) /
-                    UFS_SECTORS_PER_FRAGMENT;
-            u->hid_fragment_count = MIN(u->hid_fragment_count + frags,
-                                        u->params.hid_max_fragments);
-        }
+        u->hid_fragment_count = MIN(u->hid_fragment_count + 1,
+                                    u->params.hid_max_fragments);
     }
 
     if (!is_wlun(lun) && (lun >= UFS_MAX_LUS || u->lus[lun] == NULL)) {
@@ -1260,7 +1237,8 @@ static uint32_t ufs_read_attr_value(UfsHc *u, uint8_t idn)
         return u->attributes.defrag_operation;
     case UFS_QUERY_ATTR_IDN_HID_AVAILABLE_SIZE:
         /*
-         * If HID state is idle or analysis hasn't run, return stored value.
+         * dHIDAvailableSize is in units of 4KB (JESD220H Table 14.18).
+         * hid_fragment_count tracks fragments in the same 4KB granularity.
          * During/after analysis or defrag, reflect live fragment count.
          */
         if (u->attributes.hid_state != UFS_HID_STATE_IDLE) {

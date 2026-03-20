@@ -154,8 +154,8 @@ typedef struct UfsHc {
 
     /* HID (Host Initiated Defragmentation) emulation state */
     QEMUTimer hid_defrag_timer;
-    uint32_t hid_fragment_count;
-    uint32_t hid_defrag_total; /* fragment count when defrag started */
+    uint32_t hid_fragment_count; /* in 4KB units */
+    uint32_t hid_defrag_total;  /* fragment count when defrag started */
 } UfsHc;
 
 static inline uint32_t ufs_mcq_sq_tail(UfsHc *u, uint32_t qid)
